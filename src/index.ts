@@ -1,16 +1,55 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { ensureBrowser, closeBrowser, getPage } from './browser.js';
-import { saveSession, loadSession } from './session.js';
+import { ensureBrowser, closeBrowser, getPage, humanDelay, type BrowserLaunchOptions } from './browser.js';
+import { saveSession } from './session.js';
 import { getPlatform, listPlatforms, searchPlatforms } from './platforms.js';
+import { startMcpServer } from './mcp.js';
 
 const program = new Command();
 
 program
   .name('veil')
   .description('🕶️  OpenClaw browser remote — stealth headless browser')
-  .version('0.4.0');
+  .version('0.4.1');
+
+/**
+ * Add shared browser-selection options to a command that can create a browser.
+ */
+function addBrowserOptions(command: Command): Command {
+  return command
+    .option('--browser <browser>', 'Browser backend: playwright, chrome, or dia')
+    .option('--browser-path <path>', 'Executable path for a Chromium-compatible browser')
+    .option('--cdp-url <url>', 'Attach to a running Chromium browser via CDP')
+    .option('--user-data-dir <path>', 'Launch with a persistent browser profile directory')
+    .option('--timeout-ms <ms>', 'Browser launch/connect timeout in milliseconds');
+}
+
+/**
+ * Extract shared browser-launch options from Commander command options.
+ */
+function pickBrowserOptions(
+  opts: Partial<BrowserLaunchOptions>,
+): Pick<BrowserLaunchOptions, 'browser' | 'browserPath' | 'cdpUrl' | 'userDataDir' | 'timeoutMs'> {
+  return {
+    browser: opts.browser,
+    browserPath: opts.browserPath,
+    cdpUrl: opts.cdpUrl,
+    userDataDir: opts.userDataDir,
+    timeoutMs: opts.timeoutMs,
+  };
+}
+
+/**
+ * Parse an integer CLI option and fail fast on invalid input.
+ */
+function parseIntegerOption(value: string, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return parsed;
+}
 
 // ─── Platforms Directory ──────────────────────────────────────────────────────
 
@@ -69,24 +108,28 @@ program
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
-program
+addBrowserOptions(program
   .command('login <platform>')
   .description('Open visible browser to log in and save session')
-  .action(async (platformQuery) => {
+  .action(async (platformQuery, opts) => {
     const platform = getPlatform(platformQuery);
     const url = platformQuery.startsWith('http://') || platformQuery.startsWith('https://') 
       ? platformQuery
       : platform?.loginUrl ?? `https://${platformQuery}`;
-    const { browser, context, page } = await ensureBrowser({ headed: true, platform: platformQuery });
+    const { context, page } = await ensureBrowser({
+      ...pickBrowserOptions(opts),
+      headed: true,
+      platform: platformQuery,
+    });
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     const displayName = platform?.name || platformQuery;
     console.log(chalk.cyan(`\n🔐 Log into ${displayName} in the browser window.`));
     console.log(chalk.gray('   Press Enter here when done.\n'));
     await new Promise<void>(res => process.stdin.once('data', () => res()));
-    await saveSession(platformQuery, context);
+    await saveSession(platformQuery, await context.storageState());
     console.log(chalk.green(`✅ Session saved for ${displayName}`));
-    await browser.close();
-  });
+    await closeBrowser();
+  }));
 
 program
   .command('sessions')
@@ -103,14 +146,14 @@ program
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-program
+addBrowserOptions(program
   .command('go <url>')
   .description('Navigate to a URL')
   .option('--platform <platform>', 'Platform for session restore', 'default')
   .option('--wait <event>', 'Wait event: load|domcontentloaded|networkidle', 'domcontentloaded')
   .option('--timeout <ms>', 'Timeout in ms', '30000')
   .action(async (url, opts) => {
-    const { page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto(url, { waitUntil: opts.wait as any, timeout: parseInt(opts.timeout) });
       const title = await page.title();
@@ -120,7 +163,7 @@ program
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
     }
-  });
+  }));
 
 program
   .command('url')
@@ -361,12 +404,16 @@ program
 
 // ─── Session management ───────────────────────────────────────────────────────
 
-program
+addBrowserOptions(program
   .command('open <platform>')
   .description('Open a browser session using saved login cookies for a platform')
   .option('--headed', 'Show browser window', false)
   .action(async (platform, opts) => {
-    const { browser, context, page } = await ensureBrowser({ headed: opts.headed, platform });
+    const { page } = await ensureBrowser({
+      ...pickBrowserOptions(opts),
+      headed: opts.headed,
+      platform,
+    });
     const platformUrls: Record<string, string> = {
       x: 'https://x.com/home',
       twitter: 'https://x.com/home',
@@ -378,18 +425,17 @@ program
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     const title = await page.title();
     console.log(JSON.stringify({ ok: true, platform, url: page.url(), title }));
-  });
+  }));
 
 // ─── X / Social Interactions ─────────────────────────────────────────────────
 
-program
+addBrowserOptions(program
   .command('like')
   .description('Like the Nth post on the current page')
   .option('--nth <n>', 'Which post (0-indexed)', '0')
   .option('--platform <platform>', 'Platform for session', 'x')
   .action(async (opts) => {
-    const { ensureBrowser, humanDelay } = await import('./browser.js');
-    const { browser, page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector("article[data-testid='tweet']", { timeout: 20000 });
@@ -401,17 +447,18 @@ program
     } catch (err: any) {
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
-    } finally { await browser.close(); }
-  });
+    } finally {
+      await closeBrowser(opts.platform);
+    }
+  }));
 
-program
+addBrowserOptions(program
   .command('reply <text>')
   .description('Reply to the Nth post on the current X feed')
   .option('--nth <n>', 'Which post (0-indexed)', '0')
   .option('--platform <platform>', 'Platform for session', 'x')
   .action(async (text, opts) => {
-    const { ensureBrowser, humanDelay } = await import('./browser.js');
-    const { browser, page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector("article[data-testid='tweet']", { timeout: 20000 });
@@ -429,17 +476,18 @@ program
     } catch (err: any) {
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
-    } finally { await browser.close(); }
-  });
+    } finally {
+      await closeBrowser(opts.platform);
+    }
+  }));
 
-program
+addBrowserOptions(program
   .command('repost')
   .description('Repost (retweet) the Nth post on the current X feed')
   .option('--nth <n>', 'Which post (0-indexed)', '0')
   .option('--platform <platform>', 'Platform for session', 'x')
   .action(async (opts) => {
-    const { ensureBrowser, humanDelay } = await import('./browser.js');
-    const { browser, page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector("article[data-testid='tweet']", { timeout: 20000 });
@@ -453,17 +501,18 @@ program
     } catch (err: any) {
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
-    } finally { await browser.close(); }
-  });
+    } finally {
+      await closeBrowser(opts.platform);
+    }
+  }));
 
-program
+addBrowserOptions(program
   .command('quote <text>')
   .description('Quote the Nth post on the current X feed with your comment')
   .option('--nth <n>', 'Which post (0-indexed)', '0')
   .option('--platform <platform>', 'Platform for session', 'x')
   .action(async (text, opts) => {
-    const { ensureBrowser, humanDelay } = await import('./browser.js');
-    const { browser, page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector("article[data-testid='tweet']", { timeout: 20000 });
@@ -485,16 +534,17 @@ program
     } catch (err: any) {
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
-    } finally { await browser.close(); }
-  });
+    } finally {
+      await closeBrowser(opts.platform);
+    }
+  }));
 
-program
+addBrowserOptions(program
   .command('post <text>')
   .description('Post a tweet on X')
   .option('--platform <platform>', 'Platform for session', 'x')
   .action(async (text, opts) => {
-    const { ensureBrowser, humanDelay } = await import('./browser.js');
-    const { browser, page } = await ensureBrowser({ platform: opts.platform });
+    const { page } = await ensureBrowser({ ...pickBrowserOptions(opts), platform: opts.platform });
     try {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector("[data-testid='primaryColumn']", { timeout: 20000 });
@@ -509,8 +559,34 @@ program
     } catch (err: any) {
       console.log(JSON.stringify({ ok: false, error: err.message }));
       process.exit(1);
-    } finally { await browser.close(); }
-  });
+    } finally {
+      await closeBrowser(opts.platform);
+    }
+  }));
+
+addBrowserOptions(program
+  .command('serve')
+  .description('Start a Streamable HTTP MCP server for Claude or other MCP clients')
+  .option('--host <host>', 'Host interface to bind', '127.0.0.1')
+  .option('--port <port>', 'TCP port to bind', '3456')
+  .option('--allowed-hosts <hosts>', 'Comma-separated allowed Host header values')
+  .option('--https-cert <path>', 'TLS certificate path for direct HTTPS')
+  .option('--https-key <path>', 'TLS private key path for direct HTTPS')
+  .action(async (opts) => {
+    await startMcpServer({
+      host: opts.host,
+      port: parseIntegerOption(opts.port, 'port'),
+      allowedHosts: opts.allowedHosts
+        ? String(opts.allowedHosts)
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+        : undefined,
+      httpsCert: opts.httpsCert,
+      httpsKey: opts.httpsKey,
+      browserDefaults: pickBrowserOptions(opts),
+    });
+  }));
 
 program
   .command('close')
@@ -531,7 +607,7 @@ program
     const { isFlareSolverrUp } = await import('./local-captcha.js');
     const sessions = await listSessions();
     const flare = await isFlareSolverrUp();
-    console.log(chalk.cyan('\n🕶️  veil v0.3.0 — OpenClaw Browser Remote\n'));
+    console.log(chalk.cyan('\n🕶️  veil v0.4.1 — OpenClaw Browser Remote\n'));
     console.log(`  Sessions:     ${sessions.length > 0 ? chalk.green(sessions.join(', ')) : chalk.gray('none')}`);
     console.log(`  FlareSolverr: ${flare ? chalk.green('running') : chalk.gray('not running (auto-starts on use)')}`);
     console.log('');
@@ -544,6 +620,7 @@ program
     console.log(chalk.gray('    veil type <sel> <text>'));
     console.log(chalk.gray('    veil read [sel]     # extract text'));
     console.log(chalk.gray('    veil shot           # screenshot'));
+    console.log(chalk.gray('    veil serve          # start MCP server'));
     console.log('');
   });
 

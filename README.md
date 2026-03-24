@@ -80,6 +80,36 @@ veil shot page.png
 
 ---
 
+## Browser Selection
+
+veil can use Playwright's bundled Chromium, an installed Chrome-compatible browser, or an already-running browser exposed over CDP.
+
+```bash
+# Installed Google Chrome
+veil login reddit --browser chrome
+
+# Installed Dia
+veil login reddit --browser dia
+
+# Attach to a manually started browser over CDP
+veil login reddit --cdp-url http://127.0.0.1:9222
+
+# Launch a dedicated persistent automation profile
+veil login reddit --browser chrome --user-data-dir "$HOME/.veil/chrome-profile"
+```
+
+Supported shared browser flags:
+
+- `--browser playwright|chrome|dia`
+- `--browser-path /absolute/path/to/browser`
+- `--cdp-url http://127.0.0.1:9222`
+- `--user-data-dir /path/to/profile`
+- `--timeout-ms 45000`
+
+Use a dedicated automation profile for `--user-data-dir`. Do not point veil at your live default Chrome profile while that browser is open.
+
+---
+
 ## All Commands
 
 ### Session
@@ -89,6 +119,7 @@ veil shot page.png
 | `veil open <platform>` | Restore session and navigate to platform home |
 | `veil sessions` | List saved sessions |
 | `veil close` | Close browser |
+| `veil serve` | Start the Streamable HTTP MCP server |
 
 **Supported platforms:** `x`, `linkedin`, `reddit`, `bluesky` (or any URL)
 
@@ -137,6 +168,45 @@ veil shot page.png
 |---------|-------------|
 | `veil shot [file.png]` | Screenshot (full page with `--full`) |
 | `veil shot file.png --selector <sel>` | Screenshot specific element |
+
+---
+
+## Remote MCP Server for Claude
+
+veil now includes a real Streamable HTTP MCP server built on the official MCP SDK.
+
+Local HTTP example:
+
+```bash
+veil serve --host 127.0.0.1 --port 3456
+```
+
+Direct HTTPS example:
+
+```bash
+veil serve \
+  --host 0.0.0.0 \
+  --port 3443 \
+  --allowed-hosts your-domain.example \
+  --https-cert /etc/ssl/your-domain/fullchain.pem \
+  --https-key /etc/ssl/your-domain/privkey.pem
+```
+
+Important deployment notes:
+
+- Claude needs a reachable `https://` endpoint with a valid certificate. A localhost server or self-signed certificate is useful for testing, but not for production Claude integrations.
+- The MCP endpoint is `POST /mcp`.
+- Health checks are available at `GET /healthz`.
+- When binding to `0.0.0.0` or another non-localhost interface, set `--allowed-hosts` to the real public hostname to keep host-header validation in place.
+- You can also terminate TLS in a reverse proxy or tunnel and forward plain HTTP to `veil serve`.
+- Sessions are still created separately with `veil login <platform>`. The MCP server reuses those saved sessions when tools specify a `platform`.
+
+Smoke-test the built server locally:
+
+```bash
+npm run build
+npm run test:mcp
+```
 
 ---
 
